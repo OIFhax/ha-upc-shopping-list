@@ -1,0 +1,255 @@
+# UPC Shopping List package for Home Assistant
+# https://github.com/OIFhax/ha-upc-shopping-list
+#
+# This package expects two to-do entities:
+#   - todo.shopping_list (Home Assistant's standard Shopping List)
+#   - todo.upc_lookup_catalog (a Local To-do list used as the shared UPC catalog)
+#
+# Both entities, the display name, and the Open Food Facts locale can be
+# overridden on each script call. Catalog entries use a GTIN-14 value as their
+# summary and the learned product name as their description.
+
+rest_command:
+  upc_lookup_open_food_facts:
+    url: >-
+      https://world.openfoodfacts.org/api/v3/product/{{ barcode | urlencode }}.json?fields=code,product_name,product_name_en,generic_name,brands,quantity&product_type=all&cc={{ country_code | default('us', true) | urlencode }}&lc={{ language_code | default('en', true) | urlencode }}
+    method: GET
+    headers:
+      User-Agent: HomeAssistant-UPCShoppingList/1.0 (https://github.com/OIFhax/ha-upc-shopping-list)
+      Accept: application/json
+    timeout: 15
+    verify_ssl: true
+
+script:
+  upc_lookup_add_item:
+    alias: UPC Shopping List - Look up and add item
+    description: >-
+      Resolve or learn a UPC/EAN product name and add it to a Home Assistant
+      to-do list.
+    mode: queued
+    max: 10
+    max_exceeded: silent
+    fields:
+      barcode:
+        name: Barcode
+        description: UPC or EAN value returned by the Companion app scanner.
+        required: true
+        selector:
+          text:
+      submitted_name:
+        name: Submitted product name
+        description: >-
+          Name supplied by a user when the shared catalog and Open Food Facts
+          do not recognize the barcode.
+        required: false
+        selector:
+          text:
+      entity:
+        name: Shopping list entity
+        description: To-do entity that receives the resolved product.
+        required: false
+        default: todo.shopping_list
+        selector:
+          entity:
+            filter:
+              - domain: todo
+      catalog_entity:
+        name: UPC catalog entity
+        description: >-
+          Local To-do entity used as the server-side shared UPC catalog.
+        required: false
+        default: todo.upc_lookup_catalog
+        selector:
+          entity:
+            filter:
+              - domain: todo
+      list_name:
+        name: Shopping list name
+        description: Friendly list name returned to the scanner card.
+        required: false
+        default: Shopping List
+        selector:
+          text:
+      country_code:
+        name: Country code
+        description: Two-letter country code used by Open Food Facts.
+        required: false
+        default: us
+        selector:
+          text:
+      language_code:
+        name: Language code
+        description: Two-letter language code used by Open Food Facts.
+        required: false
+        default: en
+        selector:
+          text:
+    sequence:
+      - variables:
+          normalized_barcode: >-
+            {{ barcode | string | regex_replace('[^0-9]', '') }}
+          supplied_name: >-
+            {{ submitted_name | default('', true) | string | trim }}
+          target_list_entity: >-
+            {{ entity | default('todo.shopping_list', true) | string | trim }}
+          target_catalog_entity: >-
+            {{ catalog_entity | default('todo.upc_lookup_catalog', true) | string | trim }}
+          target_list_name: >-
+            {{ list_name | default('Shopping List', true) | string | trim }}
+          lookup_country_code: >-
+            {{ country_code | default('us', true) | string | trim | lower }}
+          lookup_language_code: >-
+            {{ language_code | default('en', true) | string | trim | lower }}
+      - if:
+          - condition: template
+            value_template: >-
+              {{ normalized_barcode | length not in [8, 12, 13, 14] }}
+        then:
+          - variables:
+              result:
+                success: false
+                reason: invalid_barcode
+                barcode: "{{ normalized_barcode }}"
+                list_entity: "{{ target_list_entity }}"
+                list_name: "{{ target_list_name }}"
+          - stop: Invalid barcode
+            response_variable: result
+      - variables:
+          catalog_barcode: >-
+            {{ ('00000000000000' ~ normalized_barcode)[-14:] }}
+      - action: todo.get_items
+        target:
+          entity_id: "{{ target_catalog_entity }}"
+        data:
+          status:
+            - needs_action
+            - completed
+        response_variable: catalog_response
+        continue_on_error: true
+      - variables:
+          catalog_product_name: >-
+            {% set ns = namespace(name='') %}
+            {% if catalog_response is defined and catalog_response is mapping %}
+              {% set items = catalog_response.get(target_catalog_entity, {}).get('items', []) %}
+              {% for item in items %}
+                {% if ns.name == ''
+                      and item is mapping
+                      and (item.get('summary') | string) == (catalog_barcode | string)
+                      and item.get('description') | default('', true) | string | trim | length > 0 %}
+                  {% set ns.name = item.get('description') | string | trim %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            {{ ns.name }}
+      - if:
+          - condition: template
+            value_template: "{{ catalog_product_name | trim | length > 0 }}"
+        then:
+          - action: todo.add_item
+            target:
+              entity_id: "{{ target_list_entity }}"
+            data:
+              item: "{{ catalog_product_name | trim }}"
+          - variables:
+              result:
+                success: true
+                barcode: "{{ normalized_barcode }}"
+                gtin: "{{ catalog_barcode }}"
+                name: "{{ catalog_product_name | trim }}"
+                source: shared_catalog
+                learned: false
+                list_entity: "{{ target_list_entity }}"
+                list_name: "{{ target_list_name }}"
+          - stop: Shared catalog product added to shopping list
+            response_variable: result
+      - if:
+          - condition: template
+            value_template: "{{ supplied_name | length > 0 }}"
+        then:
+          - action: todo.add_item
+            target:
+              entity_id: "{{ target_catalog_entity }}"
+            data:
+              item: "{{ catalog_barcode }}"
+              description: "{{ supplied_name }}"
+          - action: todo.add_item
+            target:
+              entity_id: "{{ target_list_entity }}"
+            data:
+              item: "{{ supplied_name }}"
+          - variables:
+              result:
+                success: true
+                barcode: "{{ normalized_barcode }}"
+                gtin: "{{ catalog_barcode }}"
+                name: "{{ supplied_name }}"
+                source: shared_catalog
+                learned: true
+                list_entity: "{{ target_list_entity }}"
+                list_name: "{{ target_list_name }}"
+          - stop: Product learned and added to shopping list
+            response_variable: result
+      - action: rest_command.upc_lookup_open_food_facts
+        data:
+          barcode: "{{ normalized_barcode }}"
+          country_code: "{{ lookup_country_code }}"
+          language_code: "{{ lookup_language_code }}"
+        response_variable: product_response
+        continue_on_error: true
+      - variables:
+          product_name: >-
+            {% if product_response is defined
+                  and product_response.status == 200
+                  and product_response.content is mapping
+                  and product_response.content.get('result', {}).get('id') == 'product_found'
+                  and product_response.content.get('product') is mapping %}
+              {% set product = product_response.content.get('product', {}) %}
+              {{ product.get('product_name')
+                 or product.get('product_name_en')
+                 or product.get('generic_name')
+                 or product.get('brands')
+                 or '' }}
+            {% else %}
+              {{ '' }}
+            {% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ product_name | trim | length > 0 }}"
+        then:
+          - action: todo.add_item
+            target:
+              entity_id: "{{ target_list_entity }}"
+            data:
+              item: "{{ product_name | trim }}"
+          - variables:
+              result:
+                success: true
+                barcode: "{{ normalized_barcode }}"
+                gtin: "{{ catalog_barcode }}"
+                name: "{{ product_name | trim }}"
+                source: open_food_facts
+                learned: false
+                list_entity: "{{ target_list_entity }}"
+                list_name: "{{ target_list_name }}"
+          - stop: Open Food Facts product added to shopping list
+            response_variable: result
+        else:
+          - variables:
+              result:
+                success: false
+                barcode: "{{ normalized_barcode }}"
+                gtin: "{{ catalog_barcode }}"
+                list_entity: "{{ target_list_entity }}"
+                list_name: "{{ target_list_name }}"
+                reason: >-
+                  {% if product_response is not defined %}
+                    lookup_error
+                  {% elif product_response.status == 429 %}
+                    rate_limited
+                  {% elif product_response.status | int(0) >= 500 %}
+                    service_unavailable
+                  {% else %}
+                    not_found
+                  {% endif %}
+          - stop: Product name not found
+            response_variable: result
